@@ -270,6 +270,9 @@ class QtVersion:
     return self.patch < other.patch
 
 
+QTBUG_145239_FIXED_VERSION = QtVersion(6, 11, 1)
+
+
 def get_qt_version(args: argparse.Namespace) -> QtVersion:
   """Get the Qt version.
 
@@ -293,6 +296,76 @@ def get_qt_version(args: argparse.Namespace) -> QtVersion:
       minor=int(ver_string_tuple[1]),
       patch=int(ver_string_tuple[2]),
   )
+
+
+def apply_qtbug_145239_workaround(args: argparse.Namespace) -> None:
+  """Patch extracted Qt sources for QTBUG-145239 on macOS.
+
+  Qt 6.11.1 and later include the upstream fix. Earlier versions can fail to
+  build with recent Xcode because qyieldcpu.h prefers __yield() over
+  __builtin_arm_yield().
+  """
+  if not is_mac():
+    return
+
+  qt_version = get_qt_version(args)
+  if qt_version >= QTBUG_145239_FIXED_VERSION:
+    return
+
+  header_path = pathlib.Path(args.qt_src_dir).resolve().joinpath(
+      'src', 'corelib', 'thread', 'qyieldcpu.h'
+  )
+  if args.dryrun:
+    print(f'dryrun: patch {header_path} for QTBUG-145239')
+    return
+  if not header_path.exists():
+    raise FileNotFoundError(f'Could not find {header_path}')
+
+  old = """#if __has_builtin(__yield)
+    __yield();              // Generic
+#elif defined(_YIELD_PROCESSOR) && defined(Q_CC_MSVC)
+    _YIELD_PROCESSOR();     // Generic; MSVC's <atomic>
+
+#elif __has_builtin(__builtin_ia32_pause)
+    __builtin_ia32_pause();
+#elif defined(Q_PROCESSOR_X86) && defined(Q_CC_GNU)
+    // GCC < 10 didn't have __has_builtin()
+    __builtin_ia32_pause();
+#elif defined(Q_PROCESSOR_X86) && defined(Q_CC_MSVC)
+    _mm_pause();
+#elif defined(Q_PROCESSOR_X86)
+    __asm__(\"pause\");           // hopefully asm() works in this compiler
+
+#elif __has_builtin(__builtin_arm_yield)
+    __builtin_arm_yield();
+"""
+  new = """#if __has_builtin(__builtin_arm_yield)
+    __builtin_arm_yield();
+#elif __has_builtin(__yield)
+    __yield();              // Generic
+#elif defined(_YIELD_PROCESSOR) && defined(Q_CC_MSVC)
+    _YIELD_PROCESSOR();     // Generic; MSVC's <atomic>
+
+#elif __has_builtin(__builtin_ia32_pause)
+    __builtin_ia32_pause();
+#elif defined(Q_PROCESSOR_X86) && defined(Q_CC_GNU)
+    // GCC < 10 didn't have __has_builtin()
+    __builtin_ia32_pause();
+#elif defined(Q_PROCESSOR_X86) && defined(Q_CC_MSVC)
+    _mm_pause();
+#elif defined(Q_PROCESSOR_X86)
+    __asm__(\"pause\");           // hopefully asm() works in this compiler
+
+"""
+
+  content = header_path.read_text(encoding='utf-8')
+  if new in content:
+    return
+  if old not in content:
+    raise ValueError(f'Unsupported qyieldcpu.h contents: {header_path}')
+
+  print(f'Applying QTBUG-145239 workaround to {header_path}')
+  header_path.write_text(content.replace(old, new, 1), encoding='utf-8')
 
 
 def make_host_configure_options(args: argparse.Namespace) -> list[str]:
@@ -840,6 +913,8 @@ def extract_qt_src(args: argparse.Namespace) -> None:
           f.extractall(path=qt_src_dir, filter=filter)
       else:
         f.extractall(path=qt_src_dir, members=qt_extract_filter(f))
+
+  apply_qtbug_145239_workaround(args)
 
 
 def main():
